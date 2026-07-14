@@ -78,6 +78,12 @@ skillcheck --max-lines 500 skills/    # max allowed SKILL.md lines
 - **Rubrics** — validates markdown rubrics discovered in `references/*rubric*.md`
 - **openai.yaml** — tool definitions, token budget, safety constraints
 
+`skillcheck` recognizes the portable Agent Skills frontmatter fields and the documented Claude Code
+extensions (`when_to_use`, `argument-hint`, `arguments`, invocation controls, tool restrictions,
+model/context controls, skill-scoped hooks, path activation, and shell selection). Recognition means
+the field is known to a supported client; it does not make a Claude extension portable. Continue to
+run `agnix` for strict cross-agent portability checks.
+
 ## Example output
 
 When diagnostics are found, `skillcheck` exits non-zero and prints a one-line summary to stdout, with details on stderr:

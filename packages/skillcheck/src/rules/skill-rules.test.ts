@@ -60,6 +60,35 @@ describe("frontmatter-keys", () => {
     expect(frontmatterKeys(makeCtx())).toEqual([]);
   });
 
+  it("passes with documented Claude Code extension keys", () => {
+    const d = frontmatterKeys(
+      makeCtx({
+        frontmatter: {
+          keys: new Set([
+            "name",
+            "description",
+            "when_to_use",
+            "argument-hint",
+            "arguments",
+            "disable-model-invocation",
+            "user-invocable",
+            "disallowed-tools",
+            "model",
+            "effort",
+            "context",
+            "agent",
+            "hooks",
+            "paths",
+            "shell",
+          ]),
+          name: "test",
+          description: "test",
+        },
+      })
+    );
+    expect(d).toEqual([]);
+  });
+
   it("fails with unexpected keys", () => {
     const d = frontmatterKeys(
       makeCtx({
@@ -72,6 +101,13 @@ describe("frontmatter-keys", () => {
     );
     expect(d).toHaveLength(1);
     expect(d[0].message).toContain("custom-key");
+
+    const [portable, claude] = d[0].message
+      .split("Agent Skills keys: ")[1]
+      .split(". Recognized Claude Code extensions: ");
+    expect(portable).toContain("allowed-tools");
+    expect(portable).not.toContain("argument-hint");
+    expect(claude).toContain("argument-hint");
   });
 });
 
