@@ -4,24 +4,38 @@
 Subcommands:
   compute        <checks.json>            Derive dimension scores, weighted score, and grade
                                           from per-check verdicts. List non-advisory checks
-                                          only, in rubric order; per-dimension check counts are
-                                          enforced. Flags band-edge uncertainty.
+                                          only, in rubric order; per-dimension check counts and
+                                          the N-A allowlist are enforced. Flags band-edge
+                                          uncertainty and archetype-fragility.
   validate       <verdict.json>           Validate a final machine-readable verdict block
                                           (schema 2.4). Recomputes every dimension score from
                                           its embedded checks (and optional cap) and the
                                           weighted score from the archetype weights. Enforces
                                           the critical-check cap (a FAIL on a *(critical)* check
-                                          requires cap <= 3.0) and the gate-fragility rule (a
-                                          band-flippable meets_bar at the 4.5 gate requires
-                                          ensemble mode).
+                                          requires cap <= 3.0), the N-A allowlist (N-A only
+                                          where the rubric licenses it, so it cannot shrink the
+                                          denominator), the gate-fragility rule (a band-flippable
+                                          meets_bar at the 4.5 gate requires ensemble mode), the
+                                          archetype-fragility rule (a meets_bar that clears the
+                                          gate only under the chosen archetype requires ensemble),
+                                          and the domain-correctness gate (a domain-claim skill
+                                          needs correctness_tasks >= 3, checked on a probe model
+                                          distinct from the scorer (probe_model != reviewer_model)
+                                          or with a recorded same_model_probe_reason; rubric
+                                          Scoring rules / Dim3 c7).
   validate-fleet <fleet.json>             Validate a batch-mode fleet summary (fleet schema 1.0).
-  verify-evidence <verdict.json> <dir>    Re-ground each finding against the reviewed skill at
-                                          <dir>: cited file exists, line range is in range, and
-                                          any quoted "Replace ..." snippet appears verbatim.
+  verify-evidence <verdict.json> <dir>    Re-ground a verdict against the reviewed skill at
+                                          <dir>: every finding (cited file exists, line range in
+                                          range, quoted "Replace ..." snippet verbatim) AND the
+                                          mechanically-checkable defense — Dim1 metadata (name ==
+                                          dir, description angle-bracket/length) and metrics
+                                          (description_chars) re-derived from SKILL.md.
 
-compute input format:
+compute input format ("invocation_model" optional, default "dispatched"; it re-scopes the
+Dimension-2 N-A allowlist for user-invoked skills):
   {
     "archetype": "workflow",
+    "invocation_model": "dispatched",
     "dimensions": {
       "spec_compliance":        {"checks": ["PASS", ...]},               # 8 verdicts
       "trigger_precision":      {"checks": [...],                        # 4 verdicts
@@ -42,9 +56,11 @@ sources, composed by min(): (1) the *(critical)*-check cap of 3.0, which `comput
 reviewer no longer has to remember it; (2) a reviewer-supplied cap, e.g. the measured
 trigger-battery routing cap on Dimension 2.
 
-compute output includes a paste-ready "dimensions" object for the verdict block, plus a
+compute output includes a paste-ready "dimensions" object for the verdict block, a
 "band_stability" report (does any single one-level check flip change the grade band / drop the
-score below the 4.5 gate). A meets_bar claim that is gate-fragile requires ensemble mode.
+score below the 4.5 gate), and an "archetype_robustness" report (the weighted score under all
+four profiles, and whether the gate pass hinges on the chosen archetype). A meets_bar claim that
+is gate-fragile or archetype-fragile requires ensemble mode.
 
 Exit codes: 0 = OK (warnings go to stderr), 1 = validation failure, 2 = usage or input error.
 """
@@ -118,6 +134,35 @@ CRITICAL = {
     "robustness_evaluability": (1,),
 }
 ONE_LEVEL = {"PASS": ("PARTIAL",), "PARTIAL": ("PASS", "FAIL"), "FAIL": ("PARTIAL",)}
+
+# Per-dimension N-A allowlist: 0-based indices of checks the rubric grants an explicit
+# "N-A if ..." condition. Because base = 1 + 4*(PASS + 0.5*PARTIAL)/applicable and
+# applicable = checks - N-A, marking a would-be FAIL as N-A drops it from the denominator and
+# inflates the base. The scorer therefore rejects N-A anywhere the rubric does not license it,
+# so inapplicability cannot be used as a score lever. Entries that depend on archetype /
+# invocation model are layered on in na_allowed().
+NA_BASE = {
+    "spec_compliance": frozenset(),                # frontmatter/description/placeholders always apply
+    "trigger_precision": frozenset({3}),           # c4 collisions: N-A if no siblings are visible
+    "workflow_quality": frozenset(),               # a workflow's steps always apply (reference relaxes)
+    "token_efficiency": frozenset(),               # density checks always apply
+    "safety": frozenset({4, 5}),                   # c5 allowed-tools (if declared), c6 embedded commands
+    "robustness_evaluability": frozenset({3, 4}),  # c4 scripts, c5 script-coupled determinism
+    "portability": frozenset({1}),                 # c2 declared-scope honored: N-A if none declared
+}
+
+
+def na_allowed(key, archetype, invocation_model):
+    """Indices where N-A is legitimate for this dimension under the given archetype /
+    invocation model, per the rubric's own 'N-A if ...' conditions. Anything else is rejected."""
+    allowed = set(NA_BASE.get(key, ()))
+    if key == "trigger_precision" and invocation_model in ("user-invoked", "both"):
+        allowed.add(1)                  # re-scoped c2 = argument-hint: N-A if the skill takes no args
+    if key == "workflow_quality" and archetype == "reference":
+        allowed |= {0, 1, 2, 3, 4, 5}   # a reference/knowledge skill may carry minimal/no workflow
+    if key == "robustness_evaluability" and archetype == "reference":
+        allowed.add(2)                  # c3 eval material: N-A only for a trivial reference skill
+    return allowed
 
 
 def half_step(x):
@@ -219,6 +264,34 @@ def band_stability(archetype, dim_checks, dim_adj, dim_cap, weighted):
     }
 
 
+def archetype_scores(dim_finals):
+    """Weighted score under every archetype profile, reusing the same dimension finals — only
+    the weights differ, so this is the exact score the skill would get under each classification."""
+    out = {}
+    for arch, weights in WEIGHTS.items():
+        raw = Decimal("0")
+        for key, w in zip(DIMENSIONS, weights):
+            raw += Decimal(str(w)) * Decimal(str(dim_finals[key]))
+        out[arch] = two_dec(raw / 100)
+    return out
+
+
+def archetype_robustness(chosen, dim_finals, weighted):
+    """Does a gate pass hinge on the chosen archetype? Dimension finals are archetype-independent
+    (only weights change), so the per-dimension floor is too; only the >= GATE weighted test moves.
+    archetype_fragile => the chosen profile clears the gate but at least one other would not, i.e.
+    the A-grade depends on the classification and deserves a second opinion (ensemble)."""
+    scores = archetype_scores(dim_finals)
+    others_below = sorted(a for a, s in scores.items() if a != chosen and s < GATE)
+    return {
+        "scores": scores,
+        "chosen": chosen,
+        "chosen_is_max": all(scores[chosen] >= s for s in scores.values()),
+        "archetype_fragile": weighted >= GATE and bool(others_below),
+        "profiles_below_gate": others_below,
+    }
+
+
 def is_num(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
@@ -243,10 +316,9 @@ def load(path):
         fail(f"{path} is not valid JSON: {e}")
 
 
-def dimension_base(key, raw_checks, errors):
-    """Normalize checks, enforce the rubric count, and return (checks, base, applicable, na).
-
-    Appends to errors and returns None on failure."""
+def dimension_base(key, raw_checks, errors, archetype=None, invocation_model="dispatched"):
+    """Normalize checks, enforce the rubric count and N-A allowlist, and return
+    (checks, base, applicable, na). Appends to errors and returns None on failure."""
     if not isinstance(raw_checks, list):
         errors.append(f"{key}: checks must be a list")
         return None
@@ -259,6 +331,14 @@ def dimension_base(key, raw_checks, errors):
     if len(checks) != expected:
         errors.append(f"{key}: expected {expected} non-advisory check verdicts in rubric order, got {len(checks)} "
                       f"(advisory checks are excluded; never drop or merge scored checks)")
+        return None
+    allowed = na_allowed(key, archetype, invocation_model)
+    bad_na = [i + 1 for i, c in enumerate(checks) if c == "N-A" and i not in allowed]
+    if bad_na:
+        errors.append(f"{key}: N-A is not licensed at check(s) {bad_na} for archetype "
+                      f"{archetype!r}/{invocation_model!r} — these checks have no rubric 'N-A if ...' "
+                      "condition; score them PASS/PARTIAL/FAIL or flag a rubric maintenance item "
+                      "(N-A shrinks the denominator and would inflate the score)")
         return None
     na = checks.count("N-A")
     applicable = len(checks) - na
@@ -298,6 +378,10 @@ def compute(path):
     archetype = data.get("archetype")
     if archetype not in WEIGHTS:
         fail(f"archetype must be one of {sorted(WEIGHTS)}, got {archetype!r}")
+    invocation_model = data.get("invocation_model", "dispatched")
+    if invocation_model not in INVOCATION_MODELS:
+        fail(f"invocation_model must be one of {sorted(INVOCATION_MODELS)} when provided, "
+             f"got {invocation_model!r}")
     dims = data.get("dimensions")
     if not isinstance(dims, dict):
         fail('missing "dimensions" object')
@@ -314,7 +398,7 @@ def compute(path):
         if not isinstance(spec, dict):
             errors.append(f"{key}: must be an object with a checks list")
             continue
-        based = dimension_base(key, spec.get("checks"), errors)
+        based = dimension_base(key, spec.get("checks"), errors, archetype, invocation_model)
         adjusted = read_adjustment(key, spec, errors)
         ok_cap, cap = read_cap(key, spec, errors)
         if based is None or adjusted is None or not ok_cap:
@@ -364,6 +448,12 @@ def compute(path):
     elif uncertain:
         warnings.append(f"weighted score {weighted} is within {BAND_EDGE_TOL} of a grade-band edge "
                         "(band-uncertain) — report the flag, though it does not by itself force ensemble.")
+    arch_robust = archetype_robustness(archetype, {k: detail[k]["final"] for k in DIMENSIONS}, weighted)
+    if arch_robust["archetype_fragile"]:
+        warnings.append(f"weighted score {weighted} is archetype-fragile: it clears the {GATE} gate as "
+                        f"{archetype} but not as {', '.join(arch_robust['profiles_below_gate'])} "
+                        f"({arch_robust['scores']}). A meets_bar claim requires ensemble mode "
+                        "(validate-enforced) so the classification gets a second opinion.")
     result = {
         "archetype": archetype,
         "dimensions": verdict_dims,   # paste-ready for the verdict block
@@ -374,6 +464,7 @@ def compute(path):
         "grade": band(weighted),
         "band_uncertain": uncertain,
         "band_stability": stability,
+        "archetype_robustness": arch_robust,
         "warnings": warnings,
     }
     for w in warnings:
@@ -407,7 +498,8 @@ def validate(path):
     archetype = need("archetype", str)
     if archetype is not None and archetype not in WEIGHTS:
         errors.append(f"archetype must be one of {sorted(WEIGHTS)}")
-    if need("invocation_model", str) not in INVOCATION_MODELS:
+    invocation_model = need("invocation_model", str)
+    if invocation_model not in INVOCATION_MODELS:
         errors.append(f"invocation_model must be one of {sorted(INVOCATION_MODELS)}")
     mode = need("review_mode", str)
     if mode not in REVIEW_MODES:
@@ -419,9 +511,41 @@ def validate(path):
         errors.append(f"independence must be one of {sorted(INDEPENDENCE)}")
     probe_run = need("probe_run", bool)
     skip_reason = need("probe_skip_reason", str, allow_none=True)
+    # Domain-correctness gate (rubric Scoring rules / Dim3 c7): optional fields, conservative
+    # defaults. A domain-claim skill cannot meet the bar without outcome correctness checked
+    # over >= 3 tasks, so omitting the fields (domain_claims true / 0 tasks) blocks the bar.
+    domain_claims = v.get("domain_claims", True)
+    if "domain_claims" in v and not isinstance(domain_claims, bool):
+        errors.append("domain_claims must be a boolean (does the skill encode domain/technical claims?)")
+        domain_claims = True
+    correctness_tasks = v.get("correctness_tasks", 0)
+    if "correctness_tasks" in v and (not isinstance(correctness_tasks, int)
+                                     or isinstance(correctness_tasks, bool) or correctness_tasks < 0):
+        errors.append("correctness_tasks must be a non-negative integer "
+                      "(count of probe tasks that judged outcome correctness, not mere unblocking)")
+        correctness_tasks = 0
+    if isinstance(correctness_tasks, int) and correctness_tasks > 0 and probe_run is False:
+        errors.append("correctness_tasks > 0 requires probe_run true — outcome correctness is judged by the probe")
+    # Probe-model independence (rubric Scoring rules / Dim3 c7): a same-model correctness probe
+    # inherits the scorer's own blind spots, so a domain-claim skill's gate needs the probe run on
+    # a model distinct from the scorer (probe_model != reviewer_model) or, when only one model is
+    # available, an explicit same_model_probe_reason. Both optional; absent both, independence is
+    # unestablished and the bar stays blocked for a domain-claim skill (conservative default).
+    probe_model = v.get("probe_model")
+    if "probe_model" in v and probe_model is not None and not (
+            isinstance(probe_model, str) and probe_model.strip()):
+        errors.append("probe_model must be a non-empty model identifier or null")
+        probe_model = None
+    same_model_reason = v.get("same_model_probe_reason")
+    if "same_model_probe_reason" in v and same_model_reason is not None and not (
+            isinstance(same_model_reason, str) and same_model_reason.strip()):
+        errors.append("same_model_probe_reason must be a non-empty string or null")
+        same_model_reason = None
+    if isinstance(probe_model, str) and probe_model.strip() and probe_run is False:
+        errors.append("probe_model is set but probe_run is false — a recorded probe model implies the probe ran")
     reviewed_commit = need("reviewed_commit", str, allow_none=True)
     base_commit = need("base_verdict_commit", str, allow_none=True)
-    need("reviewer_model", str, allow_none=True)
+    reviewer_model = need("reviewer_model", str, allow_none=True)
     reviewer_models = need("reviewer_models", list, allow_none=True)
     if mode == "ensemble":
         if not (isinstance(reviewer_models, list) and len(reviewer_models) >= 3
@@ -533,7 +657,8 @@ def validate(path):
             if not isinstance(spec, dict):
                 errors.append(f"dimensions.{key} must be an object with score/checks/adjustment in {depth} depth")
                 continue
-            based = dimension_base(key, spec.get("checks"), errors)
+            based = dimension_base(key, spec.get("checks"), errors,
+                                   archetype if archetype in WEIGHTS else None, invocation_model)
             adjusted = read_adjustment(key, spec, errors)
             ok_cap, cap = read_cap(key, spec, errors)
             if based is None or adjusted is None or not ok_cap:
@@ -577,8 +702,16 @@ def validate(path):
                 errors.append("incremental verdicts can never set meets_bar true — gates require a fresh full review")
             if depth == "full" and is_num(ws) and isinstance(meets, bool):
                 probe_ok = bool(probe_run) or bool(skip_reason and str(skip_reason).strip())
+                model_independent = (
+                    isinstance(probe_model, str) and probe_model.strip()
+                    and isinstance(reviewer_model, str) and reviewer_model.strip()
+                    and probe_model.strip() != reviewer_model.strip()
+                ) or bool(isinstance(same_model_reason, str) and same_model_reason.strip())
+                correctness_ok = (not domain_claims) or (
+                    isinstance(correctness_tasks, int) and correctness_tasks >= 3
+                    and model_independent)
                 expected = (ws >= GATE and counts["P1"] == 0 and not blockers
-                            and min(scores.values()) >= DIMENSION_FLOOR and probe_ok)
+                            and min(scores.values()) >= DIMENSION_FLOOR and probe_ok and correctness_ok)
                 if expected and len(scores) == len(DIMENSIONS):
                     stab = band_stability(archetype, all_checks, all_adj, all_cap, ws)
                     if stab["gate_fragile"] and mode != "ensemble":
@@ -587,12 +720,25 @@ def validate(path):
                             f"drops it to {stab['min_under_one_flip']} < {GATE}) requires ensemble mode "
                             "(3 independent reviews); run an ensemble or do not claim the bar")
                         expected = False
+                    arch_rob = archetype_robustness(archetype, scores, ws)
+                    if arch_rob["archetype_fragile"] and mode != "ensemble":
+                        errors.append(
+                            f"meets_bar at an archetype-fragile weighted_score ({ws}: clears {GATE} as "
+                            f"{archetype} but not as {', '.join(arch_rob['profiles_below_gate'])}) requires "
+                            "ensemble mode (a second opinion on the classification); run an ensemble or "
+                            "do not claim the bar")
+                        expected = False
                 if meets != expected:
                     errors.append(
                         f"meets_bar={meets} is inconsistent (weighted_score {ws}, p1_count {counts['P1']}, "
                         f"blockers {len(blockers or [])}, min dimension {min(scores.values())} vs floor "
                         f"{DIMENSION_FLOOR}, probe_run {probe_run} / skip_reason "
-                        f"{'set' if skip_reason else 'null'} -> expected {expected})")
+                        f"{'set' if skip_reason else 'null'}, domain_claims {domain_claims} / "
+                        f"correctness_tasks {correctness_tasks} (>= 3 required for domain-claim skills), "
+                        f"probe_model {probe_model!r} vs reviewer_model {reviewer_model!r} / "
+                        f"same_model_probe_reason {'set' if same_model_reason else 'null'} "
+                        f"(a domain-claim gate needs a distinct probe model or a recorded reason) "
+                        f"-> expected {expected})")
 
     if errors:
         for e in errors:
@@ -651,8 +797,38 @@ def extract_replace_snippet(patch):
     return m.group(1).strip() if m else None
 
 
+def parse_frontmatter(text):
+    """Extract the YAML frontmatter and its simple scalar keys without a YAML dependency.
+
+    Returns (has_frontmatter, fields, single_line): fields maps top-level scalar keys to their
+    value (None for a block scalar we cannot reconstruct); single_line is the set of keys that
+    parsed as a clean one-line scalar, so callers never measure a value they could not rebuild."""
+    if not text.startswith("---"):
+        return False, {}, set()
+    rows = text.split("\n")
+    end = next((i for i in range(1, len(rows)) if rows[i].strip() == "---"), None)
+    if end is None:
+        return False, {}, set()
+    fields, single_line = {}, set()
+    for ln in rows[1:end]:
+        m = re.match(r"([A-Za-z0-9_-]+):\s*(.*)$", ln)   # leading-space (nested) lines won't match
+        if not m or m.group(1) in fields:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val and val[0] in "|>":              # block scalar — not reconstructable here
+            fields[key] = None
+            continue
+        if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]
+        fields[key] = val
+        single_line.add(key)
+    return True, fields, single_line
+
+
 def verify_evidence(verdict_path, skill_dir):
-    """Re-ground a verdict's findings against the reviewed skill on disk."""
+    """Re-ground a verdict against the reviewed skill on disk: every finding's citation (the
+    prosecution) AND the mechanically-checkable Dimension-1 / metrics PASS claims (the defense),
+    so a clean metadata verdict cannot be asserted against a skill that contradicts it."""
     v = load(verdict_path)
     if not os.path.isdir(skill_dir):
         fail(f"not a directory: {skill_dir}")
@@ -686,11 +862,51 @@ def verify_evidence(verdict_path, skill_dir):
         snip = extract_replace_snippet(f.get("patch", ""))
         if snip and snip not in text:
             problems.append(f"{fid}: patch 'Replace' snippet not found verbatim in {rel}: {snip[:60]!r}")
+
+    # Ground the defense: re-derive the mechanically-checkable PASS claims (Dim1 metadata +
+    # metrics) from disk. Subjective PASSes (workflow shape, density judgments) stay reviewer
+    # judgment — no deterministic tool can ground those, and pretending otherwise is theater.
+    grounded = []
+    spec_checks = (((v.get("dimensions") or {}).get("spec_compliance") or {}).get("checks") or [])
+    metrics = v.get("metrics") or {}
+    skill_md = os.path.join(skill_dir, "SKILL.md")
+    if not os.path.isfile(skill_md):
+        problems.append(f"metadata: SKILL.md not found under {skill_dir}")
+    else:
+        with open(skill_md, encoding="utf-8", errors="replace") as fh:
+            md = fh.read()
+        has_fm, fm, single = parse_frontmatter(md)
+        dir_name = os.path.basename(os.path.abspath(skill_dir))
+        if not has_fm:
+            problems.append("metadata: SKILL.md has no '---' YAML frontmatter block")
+        else:
+            name = fm.get("name")
+            if isinstance(name, str):
+                grounded.append("name")
+                if name != dir_name:               # Dim1 c2 is checks[1]
+                    msg = f"frontmatter name {name!r} != directory {dir_name!r}"
+                    problems.append(f"spec_compliance c2 marked PASS but {msg}"
+                                    if len(spec_checks) > 1 and spec_checks[1] == "PASS"
+                                    else f"metadata: {msg}")
+            desc = fm.get("description")
+            if isinstance(desc, str) and "description" in single:
+                grounded.append("description")
+                if "<" in desc or ">" in desc:     # Dim1 c3 forbids angle brackets
+                    problems.append("spec_compliance c3 marked PASS but description contains angle brackets"
+                                    if len(spec_checks) > 2 and spec_checks[2] == "PASS"
+                                    else "metadata: description contains angle brackets")
+                if len(desc) > 1024:
+                    problems.append(f"metadata: description is {len(desc)} chars (> 1024 limit)")
+                dc = metrics.get("description_chars")
+                if isinstance(dc, int) and not isinstance(dc, bool) and dc != len(desc):
+                    problems.append(f"metrics.description_chars {dc} != measured {len(desc)}")
+
     if problems:
         for p in problems:
             print(f"unverified: {p}", file=sys.stderr)
         sys.exit(1)
-    print(f"evidence OK ({checked} finding(s) grounded against {skill_dir})")
+    print(f"evidence OK ({checked} finding(s) + {len(grounded)} metadata fact(s) "
+          f"grounded against {skill_dir})")
 
 
 def main():

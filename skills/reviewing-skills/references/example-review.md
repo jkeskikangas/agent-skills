@@ -186,6 +186,8 @@ Included because a P1 exists and weighted score < 4.5.
   "independence": "inline",
   "probe_run": false,
   "probe_skip_reason": null,
+  "domain_claims": true,
+  "correctness_tasks": 0,
   "reviewed_commit": "3f9c2ab",
   "base_verdict_commit": null,
   "reviewer_model": "claude-fable-5",

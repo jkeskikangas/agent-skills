@@ -16,7 +16,7 @@ Budget: keep a single full review under ~350 lines excluding the JSON verdict �
 
 ## Dimension Scores
 
-Weights come from the archetype profile in the rubric — copy them; do not invent weights. Derive each score from its check results (next section) via `scripts/score.py compute` (rubric formula as manual fallback); note any holistic adjustment **or cap** in the Note column (a FAIL on a *(critical)* check caps the dimension at 3.0 — the scorer applies this automatically and `validate` requires it; a trigger battery caps Dimension 2; net adjustment effect is capped at ±0.15, caps are exempt). If `compute` reports `gate_fragile` (a single check flip would drop the score below 4.5), say so here and escalate to ensemble before claiming the bar; report `band_uncertain` too when set.
+Weights come from the archetype profile in the rubric — copy them; do not invent weights. Derive each score from its check results (next section) via `scripts/score.py compute` (rubric formula as manual fallback); note any holistic adjustment **or cap** in the Note column (a FAIL on a *(critical)* check caps the dimension at 3.0 — the scorer applies this automatically and `validate` requires it; a trigger battery caps Dimension 2; net adjustment effect is capped at ±0.15, caps are exempt). If `compute` reports `gate_fragile` (a single check flip would drop the score below 4.5) or `archetype_fragile` (the score clears 4.5 only under the chosen archetype — see `archetype_robustness`), say so here and escalate to ensemble before claiming the bar; report `band_uncertain` too when set.
 
 | Dimension | Weight | Score | Weight × Score | Note |
 |---|---:|---:|---:|---|
@@ -62,6 +62,7 @@ Per dimension: grade every rubric check PASS/PARTIAL/FAIL/N-A. Group clean PASSe
 | Security: malicious behavior | [PASS/FAIL/SKIP] | [exfiltration / secret-harvesting / permission-weakening instructions, or "none"] |
 | Security: allowed-tools least privilege | [PASS/FAIL/SKIP] | [requested vs needed, or "not declared"] |
 | Score computed & verdict validated | [PASS/FAIL/SKIP] | [`scripts/score.py compute` (dimensions pasted into the verdict) + `validate` output, or manual fallback noted] |
+| Evidence re-grounded (`verify-evidence`) | [PASS/FAIL/SKIP] | [findings citations + Dim1 metadata/`description_chars` re-derived from `SKILL.md`; required to pass before claiming the bar] |
 
 ## Spec Violations (Blockers)
 
@@ -149,6 +150,10 @@ Always end the report with this fenced JSON block (consumed by generator↔criti
   "independence": "fresh-context|inline",
   "probe_run": false,
   "probe_skip_reason": null,
+  "domain_claims": true,
+  "correctness_tasks": 0,
+  "probe_model": null,
+  "same_model_probe_reason": null,
   "reviewed_commit": null,
   "base_verdict_commit": null,
   "reviewer_model": null,
@@ -198,8 +203,10 @@ Always end the report with this fenced JSON block (consumed by generator↔criti
 - Scores use the rubric scale 1.0–5.0; the `null`s above are placeholders to fill in a full review, never valid full-review output. Paste the `dimensions` object straight from `scripts/score.py compute` — each entry embeds the non-advisory check verdicts in rubric order, the holistic `adjustment`, its `adjustment_note`, and the dimension `cap` (null when none; otherwise the critical-check or routing cap), so the validator can recompute every score. In triage depth, `weighted_score`, `grade`, and every `dimensions` value stay null and `meets_bar` stays false.
 - `reviewed_commit`: short hash of the last commit touching the skill (`git log -1 --format=%h -- <skill>`), with `-dirty` appended when `git status --porcelain -- <skill>` is non-empty, or null outside git — lets loop automation tell skill changes from reviewer drift. Incremental depth requires a clean (non-`-dirty`) `base_verdict_commit`; against a dirty prior verdict, fall back to a full review. `base_verdict_commit`: only in incremental depth — the commit the prior full review scored; null otherwise. `reviewer_model`: the model identifier the reviewer runs as, or null if unknown. `reviewer_models`: the ensemble jury (≥3 entries, ideally heterogeneous); null outside ensemble mode.
 - `probe_skip_reason`: required (non-null, one line) whenever `meets_bar` is true with `probe_run` false; null otherwise unless explaining a skip.
+- `domain_claims` / `correctness_tasks`: `domain_claims` is true when the skill encodes domain/technical claims (most do); `correctness_tasks` counts the probe tasks that judged **outcome correctness** (not mere unblocking). For a domain-claim skill, `validate` requires `correctness_tasks >= 3` before `meets_bar` can be true (rubric Scoring rules / Dimension 3 c7). Set `domain_claims: false` only for a skill that makes no domain claims. Both are optional and default to `true` / `0` — omitting them conservatively blocks the bar until correctness is recorded. `correctness_tasks > 0` requires `probe_run: true`.
+- `probe_model` / `same_model_probe_reason`: a same-model correctness probe inherits the scorer's blind spots, so a domain-claim skill's bar additionally needs the probe run on a model **distinct from the scorer**. Record the probe's model in `probe_model`; `validate` requires `probe_model != reviewer_model`, or a one-line `same_model_probe_reason` when only one model is available. Both optional and default null — absent both, independence is unestablished and the bar stays blocked for a domain-claim skill. A set `probe_model` requires `probe_run: true`.
 - `blockers` entries are objects: `registry_item` (1–7, the rubric's blocker registry), `summary`, and `finding_id` of the companion P1 finding.
 - `findings` embeds every reported finding (`patch` may be empty for P3s; `lines` is a string like "41" or "55-96"); the `p*_count` fields are derived from it. `dimension` names the rubric dimension a finding maps to (or null); `support` is the number of ensemble reviews that reported the finding (must be null outside ensemble mode).
 - `maintenance_notes`: rubric/spec staleness observed during the review (e.g., a platform key the rubric does not know), for the skill maintainer.
-- `meets_bar` follows the rubric's canonical Quality bar: full depth, `weighted_score >= 4.5`, `p1_count == 0`, empty `blockers`, every dimension score ≥ 3.5, probe run or skip reason recorded, and — when the score is gate-fragile (a single check flip drops it below 4.5) — ensemble mode.
+- `meets_bar` follows the rubric's canonical Quality bar: full depth, `weighted_score >= 4.5`, `p1_count == 0`, empty `blockers`, every dimension score ≥ 3.5, probe run or skip reason recorded, **and — for a domain-claim skill (`domain_claims: true`) — outcome correctness checked over ≥3 tasks (`correctness_tasks >= 3`) on a probe model distinct from the scorer (`probe_model != reviewer_model`, or a recorded `same_model_probe_reason`), which `validate` enforces** — and — when the score is gate-fragile (a single check flip drops it below 4.5) — ensemble mode.
 - Validate the finished block with `python3 scripts/score.py validate <verdict.json>` before delivering (batch fleet summaries: `validate-fleet`). An informative JSON Schema ships at `references/verdict.schema.json`; the script is canonical.

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "reviewing-skills machine-readable verdict (schema 2.4)",
-  "description": "Informative JSON Schema for the verdict block that closes every review. scripts/score.py validate is the canonical validator: it additionally enforces cross-field rules this schema cannot express (dimension scores recomputed from checks and the enforced critical-check cap, weighted score from archetype weights, expected per-dimension check counts, finding-count consistency, meets_bar consistency including the gate-fragility ensemble rule, and depth- and mode-conditional requirements).",
+  "description": "Informative JSON Schema for the verdict block that closes every review. scripts/score.py validate is the canonical validator: it additionally enforces cross-field rules this schema cannot express (dimension scores recomputed from checks and the enforced critical-check cap, the N-A allowlist (N-A only where the rubric licenses it, so it cannot shrink a dimension's denominator), weighted score from archetype weights, expected per-dimension check counts, finding-count consistency, meets_bar consistency including the gate-fragility ensemble rule, the archetype-fragility ensemble rule (a meets_bar that clears the gate only under the chosen archetype requires ensemble), and the domain-correctness gate (correctness_tasks >= 3 checked on a probe model distinct from the scorer, for a domain-claim skill), and depth- and mode-conditional requirements). domain_claims and correctness_tasks are optional and default to true / 0 (conservative: omitting them blocks meets_bar for a domain-claim skill until correctness is recorded). probe_model and same_model_probe_reason are likewise optional: a domain-claim skill's meets_bar additionally needs the correctness probe to have run on a model distinct from the scorer (probe_model != reviewer_model) or a recorded same_model_probe_reason (the single-model case); absent both, independence is unestablished and the bar stays blocked. A set probe_model requires probe_run true.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,6 +22,10 @@
     "independence": {"enum": ["fresh-context", "inline"]},
     "probe_run": {"type": "boolean"},
     "probe_skip_reason": {"type": ["string", "null"]},
+    "domain_claims": {"type": "boolean"},
+    "correctness_tasks": {"type": "integer", "minimum": 0},
+    "probe_model": {"type": ["string", "null"]},
+    "same_model_probe_reason": {"type": ["string", "null"]},
     "reviewed_commit": {"type": ["string", "null"]},
     "base_verdict_commit": {"type": ["string", "null"]},
     "reviewer_model": {"type": ["string", "null"]},

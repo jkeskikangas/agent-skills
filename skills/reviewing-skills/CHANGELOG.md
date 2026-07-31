@@ -1,5 +1,27 @@
 # Changelog — reviewing-skills
 
+## 2.4.1 (2026-06-14) — enforcement & blocker-registry fixes (rubric/schema remain 2.4)
+
+Self-review enforcement pass — closing anti-Goodhart gaps between what the rubric *says* and what the tooling *enforced*. The scorer is deterministic, but its inputs (check verdicts, N-A calls, archetype choice, probe attestation) were the highest-leverage judgments and several were unchecked; each fix below turns a silent reviewer choice into a recorded, scorer-verified one.
+
+**Domain-correctness gate now enforced by `validate`**
+- `validate` blocks `meets_bar: true` for a domain-claim skill unless outcome correctness was checked over ≥3 tasks. Two optional verdict fields carry the signal: `domain_claims` (default `true`) and `correctness_tasks` (default `0`); `correctness_tasks > 0` requires `probe_run: true`. Previously the 2.4 gate *documented* the ≥3-task correctness requirement (rubric Scoring rules; "Domain-correctness gate strengthened" below) but the validator only checked the `probe_run` boolean, so a structurally-perfect domain skill could reach `meets_bar` on a single dry-run probe. Omitting the fields defaults conservatively, which blocks the bar until correctness is recorded. `references/verdict.schema.json`, `references/review-template.md` (incl. the `meets_bar` definition), and `scripts/score_test.py` updated to match.
+
+**Probe-model independence now enforced by `validate`**
+- The other half of the same gap: enforcing *≥3 correctness tasks* still allowed those tasks to run on the scorer's own model, where the probe inherits the scorer's blind spots (rubric Scoring rules: "a single same-model probe inherits the scorer's own blind spots … run the correctness probe on a different model than the scorer"). The rubric demanded a distinct model in prose; nothing checked it — `reviewer_model` was even read and discarded. `validate` now requires a domain-claim skill's `meets_bar` to carry a `probe_model` distinct from `reviewer_model`, or a one-line `same_model_probe_reason` for the genuine single-model case. Both fields optional with conservative defaults (absent both → independence unestablished → bar blocked); a set `probe_model` requires `probe_run: true`. This converts same-model probing from the silent default into a deliberate, recorded choice. `references/verdict.schema.json`, `references/review-template.md`, `references/skills-rubric.md`, and `scripts/score_test.py` updated to match.
+
+**N-A allowlist enforced (denominator can no longer be gamed)**
+- `base = 1 + 4*(PASS + 0.5*PARTIAL)/applicable` with `applicable = checks − N-A`, so relabeling a would-be FAIL as N-A drops it from the denominator and inflates the score — and nothing checked that an N-A was legitimate. `score.py` now enforces a per-dimension N-A allowlist derived from the rubric's own "N-A if ..." conditions (Dim2 c4 siblings; Dim5 c5/c6 allowed-tools/commands; Dim6 c4/c5 scripts; Dim7 c2 declared scope; the workflow dimension relaxed for a reference skill; Dim2 c2 argument-hint for a user-invoked skill). N-A anywhere else is rejected by both `compute` and `validate`. `compute` gains an optional `invocation_model` input (default `dispatched`) to re-scope the Dim2 allowlist. Canonical vignettes and the shipped example are unaffected (their N-As are all licensed).
+
+**Archetype-fragility gate (classification can no longer be gamed silently)**
+- The archetype sets the weights, so choosing a favorable archetype can manufacture an A. Dimension finals are archetype-independent (only weights change), so `compute` now reports `archetype_robustness`: the weighted score under all four profiles and whether the gate pass is **archetype-fragile** (clears 4.5 under the chosen archetype but not under at least one other). `validate` requires ensemble mode for an archetype-fragile `meets_bar: true`, mirroring the gate-fragility rule — a borderline A whose grade hinges on the classification now needs an independent second opinion.
+
+**`verify-evidence` now grounds the defense, not just the prosecution**
+- It previously re-grounded only findings (the claims that *lower* the score); the PASS verdicts and metrics that *raise* it were never checked against disk. `verify-evidence` now also re-derives the mechanically-checkable defense from `SKILL.md` — frontmatter `name` == directory, description angle-bracket/length, and `metrics.description_chars` — and flags a PASS/metric that the skill contradicts (e.g. "spec_compliance c2 marked PASS but name != directory"). Subjective PASSes (workflow shape, density) remain reviewer judgment; the rubric now requires `verify-evidence` to pass before a gate.
+
+**Blocker registry vs. sanctioned linters reconciled**
+- The dangerous-embedded-command scan (registry item 7) no longer treats a reviewed skill's recommendation of a rubric-sanctioned linter (`skillcheck`, opt-in `agnix`) as a blocker, even when shown via unpinned `npx`. The blocker targets pipe-to-shell, privilege escalation, and unpinned execution of *unvetted* packages; an unpinned sanctioned linter is at most a P3 "pin it" nit. Resolves a contradiction with the Verification section, which runs those very linters.
+
 ## 2.4 (2026-06-13) — rubric 2.4, verdict schema 2.4
 
 Scorer-enforcement and reliability pass. Closes the gap between what the rubric *claimed* the deterministic scorer enforced and what it actually checked.
